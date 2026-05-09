@@ -71,6 +71,8 @@ class MedicalImageLocatorApp:
         self.status_var = tk.StringVar(value="Load images to begin.")
         self.summary_var = tk.StringVar(value="No images loaded")
         self.term_summary_var = tk.StringVar(value="No terms extracted")
+        self.auto_show_marked = True
+        self.auto_show_button_var = tk.StringVar(value="Stop Auto Show")
         self.report_provider_var = tk.StringVar(value="OpenAI GPT-5.5")
         self.openai_model_var = tk.StringVar(value=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL))
         self.openai_api_key_var = tk.StringVar()
@@ -236,6 +238,8 @@ class MedicalImageLocatorApp:
         self.select_terms_button.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         self.clear_terms_button = ttk.Button(term_actions, text="Clear Terms", command=self.clear_terms)
         self.clear_terms_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.auto_show_button = ttk.Button(term_actions, textvariable=self.auto_show_button_var, command=self.toggle_auto_show_marked)
+        self.auto_show_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Label(panel, textvariable=self.term_summary_var, wraplength=390).grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
         output_row = ttk.Frame(panel)
@@ -533,7 +537,12 @@ class MedicalImageLocatorApp:
         self._set_record_status(record)
         self._refresh_image_list()
         self._refresh_terms_list()
-        if index == self.selected_index:
+        if result.pixel_box is not None and self.auto_show_marked:
+            self.selected_index = index
+            self._select_tree_index(index)
+            self._update_current_view()
+            self.status_var.set(f"Showing marked image {record.image_id}: {term_name}.")
+        elif index == self.selected_index:
             self._update_current_view()
         self._update_action_states()
 
@@ -676,6 +685,12 @@ class MedicalImageLocatorApp:
         for term in self.terms:
             term.enabled = True
         self._refresh_terms_list()
+
+    def toggle_auto_show_marked(self) -> None:
+        self.auto_show_marked = not self.auto_show_marked
+        self.auto_show_button_var.set("Stop Auto Show" if self.auto_show_marked else "Resume Auto Show")
+        state = "on" if self.auto_show_marked else "off"
+        self.status_var.set(f"Auto show marked images is {state}.")
 
     def clear_terms(self) -> None:
         if self.busy:
@@ -833,6 +848,7 @@ class MedicalImageLocatorApp:
         self.locate_terms_button.configure(state=normal_if_ready if has_images and any(term.enabled for term in self.terms) else "disabled")
         self.select_terms_button.configure(state=normal_if_ready if self.terms else "disabled")
         self.clear_terms_button.configure(state=normal_if_ready if self.terms else "disabled")
+        self.auto_show_button.configure(state="normal")
         self.save_button.configure(state="normal" if current_annotated and not self.busy else "disabled")
         self.save_all_button.configure(state="normal" if has_annotated and not self.busy else "disabled")
         self.clear_button.configure(state="normal" if current_annotated and not self.busy else "disabled")

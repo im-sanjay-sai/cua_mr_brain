@@ -56,6 +56,8 @@ Each loaded image gets a stable study ID such as `IMG-001`. The left image table
 
 Localization runs one term at a time across all images. As soon as a term finishes scanning all images, the app immediately chooses the best image ID for that term and updates both the term table and image table. The final batch finish only summarizes the completed selections.
 
+By default, the main viewer automatically switches to a newly marked image as soon as a box is drawn. Use **Stop Auto Show** to keep the viewer fixed and manually control images with the left list, Previous/Next, or arrow keys. Use **Resume Auto Show** to turn automatic switching back on.
+
 The best-region score is deterministic app-side post-processing:
 
 ```python
