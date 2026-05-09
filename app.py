@@ -96,7 +96,7 @@ class MedicalImageLocatorApp:
         panes = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         panes.grid(row=0, column=0, sticky="nsew")
 
-        left = ttk.Frame(panes, width=280)
+        left = ttk.Frame(panes, width=380)
         center = ttk.Frame(panes)
         right = ttk.Frame(panes, width=360)
         panes.add(left, weight=0)
@@ -127,19 +127,19 @@ class MedicalImageLocatorApp:
 
         self.image_tree = ttk.Treeview(
             list_frame,
-            columns=("image_id", "status", "region"),
+            columns=("region", "status", "file"),
             show="tree headings",
             selectmode="browse",
             height=18,
         )
-        self.image_tree.heading("#0", text="File")
-        self.image_tree.heading("image_id", text="ID")
-        self.image_tree.heading("status", text="Status")
+        self.image_tree.heading("#0", text="Image")
         self.image_tree.heading("region", text="Region")
-        self.image_tree.column("#0", width=145, minwidth=120, stretch=True)
-        self.image_tree.column("image_id", width=72, minwidth=64, stretch=False)
-        self.image_tree.column("status", width=92, minwidth=76, stretch=False)
-        self.image_tree.column("region", width=110, minwidth=82, stretch=False)
+        self.image_tree.heading("status", text="Status")
+        self.image_tree.heading("file", text="File")
+        self.image_tree.column("#0", width=78, minwidth=70, stretch=False)
+        self.image_tree.column("region", width=140, minwidth=100, stretch=True)
+        self.image_tree.column("status", width=96, minwidth=78, stretch=False)
+        self.image_tree.column("file", width=130, minwidth=90, stretch=True)
         self.image_tree.grid(row=0, column=0, sticky="nsew")
         self.image_tree.bind("<<TreeviewSelect>>", self._on_image_select)
 
@@ -510,6 +510,7 @@ class MedicalImageLocatorApp:
                 if result.pixel_box is not None:
                     result.label = term.name
                 self.root.after(0, self._handle_term_result, index, term.name, result)
+            self.root.after(0, self._finalize_term_region, term.name)
 
         self.root.after(0, self._finish_term_batch)
 
@@ -549,6 +550,22 @@ class MedicalImageLocatorApp:
         if index == self.selected_index:
             self._update_current_view()
         self._update_action_states()
+
+    def _finalize_term_region(self, term_name: str) -> None:
+        updated = choose_best_regions(self.records, self.terms)
+        if term_name in updated:
+            self.best_regions[term_name] = updated[term_name]
+            best = updated[term_name]
+            self.status_var.set(
+                f"Selected {best.image_id} for {term_name} | score {best.score:.2f} | confidence {best.confidence:.2f}."
+            )
+        else:
+            self.best_regions.pop(term_name, None)
+            self.status_var.set(f"No region selected for {term_name}.")
+        self._refresh_image_list()
+        self._refresh_terms_list()
+        if self.selected_index >= 0:
+            self._update_current_view()
 
     def _finish_term_batch(self) -> None:
         self.best_regions = choose_best_regions(self.records, self.terms)
@@ -767,8 +784,8 @@ class MedicalImageLocatorApp:
                 "",
                 "end",
                 iid=str(index),
-                text=record.path.name,
-                values=(record.image_id, record.status, self._record_region_terms(record.image_id)),
+                text=record.image_id,
+                values=(self._record_region_terms(record.image_id), record.status, record.path.name),
             )
         self._select_tree_index(selected)
         self._update_summary()

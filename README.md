@@ -52,7 +52,9 @@ python -m medical_image_locator_report_identify
 6. Click **Locate Selected**.
 7. Save the current annotated image or all annotated images.
 
-Each loaded image gets a stable study ID such as `IMG-001`. After localization finishes, the app chooses one best image ID per term and shows it in the term table's **Region** column. The image table also has a **Region** column showing which terms selected that image as their best representative.
+Each loaded image gets a stable study ID such as `IMG-001`. The left image table is organized as **Image**, **Region**, **Status**, and **File**, so selected region names are visible next to each image ID.
+
+Localization runs one term at a time across all images. As soon as a term finishes scanning all images, the app immediately chooses the best image ID for that term and updates both the term table and image table. The final batch finish only summarizes the completed selections.
 
 The best-region score is deterministic app-side post-processing:
 
