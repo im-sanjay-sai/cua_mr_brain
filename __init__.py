@@ -1,2 +1,1 @@
-"""Basic medical image localization app."""
-
+"""Report-driven medical image localization app."""

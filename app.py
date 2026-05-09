@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,11 +17,13 @@ except ImportError:
 
 try:
     from .model_client import DEFAULT_BASE_URL, DEFAULT_MODEL, LocalizationResult, localize_region
+    from .report_extractor import DEFAULT_OPENAI_MODEL, ReportTerm, build_localization_prompt, extract_terms_from_report
 except ImportError:
     from model_client import DEFAULT_BASE_URL, DEFAULT_MODEL, LocalizationResult, localize_region
+    from report_extractor import DEFAULT_OPENAI_MODEL, ReportTerm, build_localization_prompt, extract_terms_from_report
 
 
-APP_TITLE = "X-ray / MRI Region Locator"
+APP_TITLE = "Medical Report Image Locator"
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".dcm"}
 
 
@@ -30,7 +32,8 @@ class ImageRecord:
     path: Path
     image: Image.Image
     annotated_image: Image.Image | None = None
-    result: LocalizationResult | None = None
+    results: dict[str, LocalizationResult] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
     error: str = ""
     status: str = "Loaded"
 
@@ -43,17 +46,21 @@ class MedicalImageLocatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1320x820")
-        self.root.minsize(1040, 680)
+        self.root.geometry("1500x960")
+        self.root.minsize(1180, 800)
 
         self.records: list[ImageRecord] = []
+        self.terms: list[ReportTerm] = []
         self.selected_index = -1
         self.tk_image: ImageTk.PhotoImage | None = None
         self.busy = False
 
-        self.question_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Load images to begin.")
         self.summary_var = tk.StringVar(value="No images loaded")
+        self.term_summary_var = tk.StringVar(value="No terms extracted")
+        self.report_provider_var = tk.StringVar(value="OpenAI GPT-5.5")
+        self.openai_model_var = tk.StringVar(value=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL))
+        self.openai_api_key_var = tk.StringVar()
         self.model_var = tk.StringVar(value=os.getenv("TZAFON_MODEL", DEFAULT_MODEL))
         self.base_url_var = tk.StringVar(value=os.getenv("TZAFON_BASE_URL", DEFAULT_BASE_URL))
         self.api_key_var = tk.StringVar()
@@ -143,32 +150,77 @@ class MedicalImageLocatorApp:
 
     def _build_right_panel(self, panel: ttk.Frame) -> None:
         panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(20, weight=1)
+        panel.rowconfigure(1, weight=1)
+        panel.rowconfigure(4, weight=1)
 
-        ttk.Label(panel, text="Question").grid(row=0, column=0, sticky="w")
-        question_entry = ttk.Entry(panel, textvariable=self.question_var)
-        question_entry.grid(row=1, column=0, sticky="ew", pady=(3, 0))
-        question_entry.bind("<Return>", lambda _event: self.ask_current())
+        ttk.Label(panel, text="Report / Diagnosis").grid(row=0, column=0, sticky="w")
+        report_frame = ttk.Frame(panel)
+        report_frame.grid(row=1, column=0, sticky="nsew", pady=(3, 0))
+        report_frame.columnconfigure(0, weight=1)
+        report_frame.rowconfigure(0, weight=1)
+        self.report_text = tk.Text(report_frame, height=8, wrap="word")
+        self.report_text.grid(row=0, column=0, sticky="nsew")
+        report_scroll = ttk.Scrollbar(report_frame, orient=tk.VERTICAL, command=self.report_text.yview)
+        report_scroll.grid(row=0, column=1, sticky="ns")
+        self.report_text.configure(yscrollcommand=report_scroll.set)
 
-        ttk.Label(panel, text="Mode").grid(row=2, column=0, sticky="w", pady=(12, 2))
-        mode = ttk.Combobox(
-            panel,
-            textvariable=self.mode_var,
-            values=("box_tool", "computer_action"),
-            state="readonly",
+        provider_row = ttk.Frame(panel)
+        provider_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        provider_row.columnconfigure(2, weight=1)
+        ttk.Radiobutton(
+            provider_row,
+            text="OpenAI GPT-5.5",
+            variable=self.report_provider_var,
+            value="OpenAI GPT-5.5",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Radiobutton(
+            provider_row,
+            text="Lightcone",
+            variable=self.report_provider_var,
+            value="Lightcone",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.extract_button = ttk.Button(provider_row, text="Extract Terms", command=self.extract_terms)
+        self.extract_button.grid(row=0, column=2, sticky="e")
+
+        ttk.Label(panel, text="Terms to Locate").grid(row=3, column=0, sticky="w", pady=(12, 2))
+        term_frame = ttk.Frame(panel)
+        term_frame.grid(row=4, column=0, sticky="nsew")
+        term_frame.columnconfigure(0, weight=1)
+        term_frame.rowconfigure(0, weight=1)
+        self.term_tree = ttk.Treeview(
+            term_frame,
+            columns=("use", "found", "status"),
+            show="tree headings",
+            selectmode="browse",
+            height=8,
         )
-        mode.grid(row=3, column=0, sticky="ew")
+        self.term_tree.heading("#0", text="Term")
+        self.term_tree.heading("use", text="Use")
+        self.term_tree.heading("found", text="Found")
+        self.term_tree.heading("status", text="Status")
+        self.term_tree.column("#0", width=170, minwidth=120, stretch=True)
+        self.term_tree.column("use", width=46, minwidth=42, stretch=False, anchor="center")
+        self.term_tree.column("found", width=56, minwidth=50, stretch=False, anchor="center")
+        self.term_tree.column("status", width=92, minwidth=76, stretch=False)
+        self.term_tree.grid(row=0, column=0, sticky="nsew")
+        self.term_tree.bind("<Double-1>", self._on_term_double_click)
+        term_scroll = ttk.Scrollbar(term_frame, orient=tk.VERTICAL, command=self.term_tree.yview)
+        term_scroll.grid(row=0, column=1, sticky="ns")
+        self.term_tree.configure(yscrollcommand=term_scroll.set)
 
-        action_row = ttk.Frame(panel)
-        action_row.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-        action_row.columnconfigure((0, 1), weight=1)
-        self.ask_button = ttk.Button(action_row, text="Ask Current", command=self.ask_current)
-        self.ask_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.ask_all_button = ttk.Button(action_row, text="Ask All", command=self.ask_all)
-        self.ask_all_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        term_actions = ttk.Frame(panel)
+        term_actions.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        term_actions.columnconfigure((0, 1, 2), weight=1)
+        self.locate_terms_button = ttk.Button(term_actions, text="Locate Selected", command=self.locate_selected_terms)
+        self.locate_terms_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.select_terms_button = ttk.Button(term_actions, text="Select All", command=self.select_all_terms)
+        self.select_terms_button.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.clear_terms_button = ttk.Button(term_actions, text="Clear Terms", command=self.clear_terms)
+        self.clear_terms_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Label(panel, textvariable=self.term_summary_var, wraplength=390).grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
         output_row = ttk.Frame(panel)
-        output_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        output_row.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         output_row.columnconfigure((0, 1), weight=1)
         self.save_button = ttk.Button(output_row, text="Save Current", command=self.save_current, state="disabled")
         self.save_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -176,38 +228,55 @@ class MedicalImageLocatorApp:
         self.save_all_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         clear_row = ttk.Frame(panel)
-        clear_row.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        clear_row.grid(row=8, column=0, sticky="ew", pady=(8, 0))
         clear_row.columnconfigure((0, 1), weight=1)
         self.clear_button = ttk.Button(clear_row, text="Clear Current", command=self.clear_current_overlay, state="disabled")
         self.clear_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.clear_all_button = ttk.Button(clear_row, text="Clear All", command=self.clear_all_overlays, state="disabled")
         self.clear_all_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
-        ttk.Separator(panel).grid(row=7, column=0, sticky="ew", pady=14)
+        ttk.Separator(panel).grid(row=9, column=0, sticky="ew", pady=12)
 
-        ttk.Label(panel, text="Model").grid(row=8, column=0, sticky="w")
-        ttk.Entry(panel, textvariable=self.model_var).grid(row=9, column=0, sticky="ew", pady=(3, 0))
+        ttk.Label(panel, text="Lightcone Localization Mode").grid(row=10, column=0, sticky="w")
+        mode = ttk.Combobox(
+            panel,
+            textvariable=self.mode_var,
+            values=("box_tool", "computer_action"),
+            state="readonly",
+        )
+        mode.grid(row=11, column=0, sticky="ew", pady=(3, 0))
 
-        ttk.Label(panel, text="Base URL").grid(row=10, column=0, sticky="w", pady=(10, 2))
-        ttk.Entry(panel, textvariable=self.base_url_var).grid(row=11, column=0, sticky="ew")
+        ttk.Label(panel, text="Lightcone Model").grid(row=12, column=0, sticky="w", pady=(8, 2))
+        ttk.Entry(panel, textvariable=self.model_var).grid(row=13, column=0, sticky="ew")
 
-        ttk.Label(panel, text="API key override").grid(row=12, column=0, sticky="w", pady=(10, 2))
-        ttk.Entry(panel, textvariable=self.api_key_var, show="*").grid(row=13, column=0, sticky="ew")
+        ttk.Label(panel, text="Lightcone Base URL").grid(row=14, column=0, sticky="w", pady=(8, 2))
+        ttk.Entry(panel, textvariable=self.base_url_var).grid(row=15, column=0, sticky="ew")
 
-        ttk.Separator(panel).grid(row=14, column=0, sticky="ew", pady=14)
+        ttk.Label(panel, text="Lightcone API key override").grid(row=16, column=0, sticky="w", pady=(8, 2))
+        ttk.Entry(panel, textvariable=self.api_key_var, show="*").grid(row=17, column=0, sticky="ew")
 
-        ttk.Label(panel, text="Answer").grid(row=15, column=0, sticky="w")
-        self.answer = tk.Text(panel, height=15, wrap="word", state="disabled")
-        self.answer.grid(row=16, column=0, sticky="nsew")
-        panel.rowconfigure(16, weight=1)
+        ttk.Separator(panel).grid(row=18, column=0, sticky="ew", pady=12)
 
-        ttk.Label(panel, textvariable=self.status_var, wraplength=340).grid(row=17, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(panel, text="OpenAI Extraction Model").grid(row=19, column=0, sticky="w")
+        ttk.Entry(panel, textvariable=self.openai_model_var).grid(row=20, column=0, sticky="ew", pady=(3, 0))
+
+        ttk.Label(panel, text="OpenAI API key override").grid(row=21, column=0, sticky="w", pady=(8, 2))
+        ttk.Entry(panel, textvariable=self.openai_api_key_var, show="*").grid(row=22, column=0, sticky="ew")
+
+        ttk.Separator(panel).grid(row=23, column=0, sticky="ew", pady=12)
+
+        ttk.Label(panel, text="Results").grid(row=24, column=0, sticky="w")
+        self.answer = tk.Text(panel, height=11, wrap="word", state="disabled")
+        self.answer.grid(row=25, column=0, sticky="nsew")
+        panel.rowconfigure(25, weight=1)
+
+        ttk.Label(panel, textvariable=self.status_var, wraplength=390).grid(row=26, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(
             panel,
             text="Visual localization only. Do not use this for clinical diagnosis.",
-            wraplength=340,
+            wraplength=390,
             foreground="#8a5a00",
-        ).grid(row=18, column=0, sticky="ew", pady=(8, 0))
+        ).grid(row=27, column=0, sticky="ew", pady=(8, 0))
         self._update_action_states()
 
     def load_images(self) -> None:
@@ -274,168 +343,196 @@ class MedicalImageLocatorApp:
         self.records.clear()
         self.selected_index = -1
         self._refresh_image_list()
+        self._refresh_terms_list()
         self._update_current_view()
         self.status_var.set("Study cleared.")
 
-    def ask_current(self) -> None:
-        index = self.selected_index
-        if index < 0 or index >= len(self.records):
-            messagebox.showinfo("No image", "Load and select an image first.")
+    def extract_terms(self) -> None:
+        report = self._report_text()
+        if not report:
+            messagebox.showinfo("No report", "Paste a report or diagnosis first.")
             return
-        question = self._validated_question()
-        if question is None:
-            return
+
+        provider = self._selected_report_provider()
         self._set_busy(True)
-        self.records[index].status = "Running"
-        self.records[index].error = ""
-        self._refresh_image_list()
-        self.status_var.set(f"Asking model for {self.records[index].path.name}...")
-        self._start_worker(index, question)
-
-    def ask_all(self) -> None:
-        if not self.records:
-            messagebox.showinfo("No images", "Load images first.")
-            return
-        question = self._validated_question()
-        if question is None:
-            return
-
-        self._set_busy(True)
-        for record in self.records:
-            record.status = "Queued"
-            record.error = ""
-        self._refresh_image_list()
-        self.status_var.set(f"Queued {len(self.records)} images.")
-        api_key = self.api_key_var.get().strip() or None
-        base_url = self.base_url_var.get().strip()
-        model = self.model_var.get().strip()
-        mode = self.mode_var.get()
-
-        thread = threading.Thread(target=self._ask_all_worker, args=(question, mode, api_key, base_url, model), daemon=True)
-        thread.start()
-
-    def _validated_question(self) -> str | None:
-        question = self.question_var.get().strip()
-        if not question:
-            messagebox.showinfo("No question", "Type a question first.")
-            return None
-        return question
-
-    def _start_worker(self, index: int, question: str) -> None:
-        record = self.records[index]
-        image = record.image.copy()
-        api_key = self.api_key_var.get().strip() or None
-        base_url = self.base_url_var.get().strip()
-        model = self.model_var.get().strip()
-        mode = self.mode_var.get()
+        self.status_var.set(f"Extracting report terms with {provider}...")
+        self._set_answer("")
 
         thread = threading.Thread(
-            target=self._ask_worker,
-            args=(index, image, question, mode, api_key, base_url, model),
+            target=self._extract_terms_worker,
+            args=(
+                report,
+                provider,
+                self.openai_api_key_var.get().strip() or None,
+                self.openai_model_var.get().strip(),
+                self.api_key_var.get().strip() or None,
+                self.base_url_var.get().strip(),
+                self.model_var.get().strip(),
+            ),
             daemon=True,
         )
         thread.start()
 
-    def _ask_all_worker(
+    def _extract_terms_worker(
         self,
-        question: str,
-        mode: str,
-        api_key: str | None,
-        base_url: str,
-        model: str,
-    ) -> None:
-        for index, record in enumerate(list(self.records)):
-            self.root.after(0, self._mark_running, index)
-            try:
-                result = localize_region(
-                    record.image.copy(),
-                    question,
-                    mode=mode,  # type: ignore[arg-type]
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                )
-            except Exception as exc:
-                self.root.after(0, self._handle_error, index, exc)
-                continue
-            self.root.after(0, self._handle_result, index, result)
-
-        self.root.after(0, self._finish_batch)
-
-    def _ask_worker(
-        self,
-        index: int,
-        image: Image.Image,
-        question: str,
-        mode: str,
-        api_key: str | None,
-        base_url: str,
-        model: str,
+        report: str,
+        provider: str,
+        openai_api_key: str | None,
+        openai_model: str,
+        tzafon_api_key: str | None,
+        tzafon_base_url: str,
+        tzafon_model: str,
     ) -> None:
         try:
-            result = localize_region(
-                image,
-                question,
-                mode=mode,  # type: ignore[arg-type]
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
+            result = extract_terms_from_report(
+                report,
+                provider=provider,  # type: ignore[arg-type]
+                openai_api_key=openai_api_key,
+                openai_model=openai_model,
+                tzafon_api_key=tzafon_api_key,
+                tzafon_base_url=tzafon_base_url,
+                tzafon_model=tzafon_model,
             )
         except Exception as exc:
-            self.root.after(0, self._handle_error, index, exc)
-            self.root.after(0, self._set_busy, False)
+            self.root.after(0, self._handle_extract_error, exc)
             return
-        self.root.after(0, self._handle_result, index, result)
-        self.root.after(0, self._set_busy, False)
+        self.root.after(0, self._handle_terms_extracted, result.terms, result.provider)
 
-    def _mark_running(self, index: int) -> None:
+    def _handle_extract_error(self, exc: Exception) -> None:
+        self.status_var.set("Term extraction failed.")
+        self._set_answer(str(exc))
+        self._set_busy(False)
+
+    def _handle_terms_extracted(self, terms: list[ReportTerm], provider: str) -> None:
+        self.terms = terms
+        for record in self.records:
+            record.results.clear()
+            record.errors.clear()
+            record.annotated_image = None
+            record.error = ""
+            record.status = "Loaded"
+        self._refresh_terms_list()
+        self._refresh_image_list()
+        self._update_current_view()
+        if terms:
+            self.status_var.set(f"Extracted {len(terms)} term{'s' if len(terms) != 1 else ''} with {provider}.")
+            self._set_answer(format_terms(terms))
+        else:
+            self.status_var.set("No localizable report terms were extracted.")
+            self._set_answer("No localizable terms found.")
+        self._set_busy(False)
+
+    def locate_selected_terms(self) -> None:
+        if not self.records:
+            messagebox.showinfo("No images", "Load images first.")
+            return
+
+        terms = [term for term in self.terms if term.enabled]
+        if not terms:
+            messagebox.showinfo("No terms", "Extract or select at least one term first.")
+            return
+
+        self._set_busy(True)
+        for record in self.records:
+            record.results.clear()
+            record.errors.clear()
+            record.annotated_image = None
+            record.error = ""
+            record.status = "Queued"
+        self._refresh_image_list()
+        self._refresh_terms_list()
+        self.status_var.set(f"Queued {len(terms)} term{'s' if len(terms) != 1 else ''} across {len(self.records)} images.")
+
+        thread = threading.Thread(
+            target=self._locate_terms_worker,
+            args=(
+                [ReportTerm(**term.__dict__) for term in terms],
+                self.mode_var.get(),
+                self.api_key_var.get().strip() or None,
+                self.base_url_var.get().strip(),
+                self.model_var.get().strip(),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _locate_terms_worker(
+        self,
+        terms: list[ReportTerm],
+        mode: str,
+        api_key: str | None,
+        base_url: str,
+        model: str,
+    ) -> None:
+        total = len(terms) * len(self.records)
+        completed = 0
+        for term in terms:
+            prompt = build_localization_prompt(term)
+            for index, record in enumerate(list(self.records)):
+                completed += 1
+                self.root.after(0, self._mark_term_running, index, term.name, completed, total)
+                try:
+                    result = localize_region(
+                        record.image.copy(),
+                        prompt,
+                        mode=mode,  # type: ignore[arg-type]
+                        api_key=api_key,
+                        base_url=base_url,
+                        model=model,
+                    )
+                except Exception as exc:
+                    self.root.after(0, self._handle_term_error, index, term.name, exc)
+                    continue
+
+                if result.pixel_box is not None:
+                    result.label = term.name
+                self.root.after(0, self._handle_term_result, index, term.name, result)
+
+        self.root.after(0, self._finish_term_batch)
+
+    def _mark_term_running(self, index: int, term_name: str, completed: int, total: int) -> None:
         if 0 <= index < len(self.records):
             self.records[index].status = "Running"
             self._refresh_image_list()
-            self.status_var.set(f"Running {index + 1}/{len(self.records)}: {self.records[index].path.name}")
+            self._refresh_terms_list()
+            self.status_var.set(f"Running {completed}/{total}: {term_name} on {self.records[index].path.name}")
 
-    def _handle_result(self, index: int, result: LocalizationResult) -> None:
+    def _handle_term_result(self, index: int, term_name: str, result: LocalizationResult) -> None:
         if not 0 <= index < len(self.records):
             return
 
         record = self.records[index]
-        record.result = result
+        record.results[term_name] = result
+        record.errors.pop(term_name, None)
         record.error = ""
-        if result.pixel_box is not None:
-            record.annotated_image = draw_annotation(record.image, result)
-            record.status = "Marked"
-        else:
-            record.annotated_image = None
-            record.status = "No region"
-
+        self._refresh_record_annotation(record)
+        self._set_record_status(record)
         self._refresh_image_list()
+        self._refresh_terms_list()
         if index == self.selected_index:
             self._update_current_view()
-            self.status_var.set(f"Updated {record.path.name}.")
         self._update_action_states()
 
-    def _handle_error(self, index: int, exc: Exception) -> None:
+    def _handle_term_error(self, index: int, term_name: str, exc: Exception) -> None:
         if not 0 <= index < len(self.records):
-            self._set_busy(False)
             return
 
         record = self.records[index]
-        record.status = "Error"
-        record.error = str(exc)
-        record.result = None
-        record.annotated_image = None
+        record.errors[term_name] = str(exc)
+        record.error = ""
+        self._set_record_status(record)
         self._refresh_image_list()
+        self._refresh_terms_list()
         if index == self.selected_index:
             self._update_current_view()
-            self.status_var.set(f"Request failed for {record.path.name}.")
         self._update_action_states()
-        if not self.busy:
-            self._set_busy(False)
 
-    def _finish_batch(self) -> None:
-        marked = sum(1 for record in self.records if record.status == "Marked")
-        errors = sum(1 for record in self.records if record.status == "Error")
-        self.status_var.set(f"Finished batch. Marked {marked}; errors {errors}.")
+    def _finish_term_batch(self) -> None:
+        marked = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is not None)
+        missing = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is None)
+        errors = sum(len(record.errors) for record in self.records)
+        self.status_var.set(f"Finished. Marked {marked}; no region {missing}; errors {errors}.")
+        self._set_answer(format_study_results(self.records, self.terms))
         self._set_busy(False)
 
     def save_current(self) -> None:
@@ -472,20 +569,24 @@ class MedicalImageLocatorApp:
         if record is None:
             return
         record.annotated_image = None
-        record.result = None
+        record.results.clear()
+        record.errors.clear()
         record.error = ""
         record.status = "Loaded"
         self._refresh_image_list()
+        self._refresh_terms_list()
         self._update_current_view()
         self.status_var.set(f"Cleared overlay for {record.path.name}.")
 
     def clear_all_overlays(self) -> None:
         for record in self.records:
             record.annotated_image = None
-            record.result = None
+            record.results.clear()
+            record.errors.clear()
             record.error = ""
             record.status = "Loaded"
         self._refresh_image_list()
+        self._refresh_terms_list()
         self._update_current_view()
         self.status_var.set("Cleared all overlays.")
 
@@ -512,6 +613,110 @@ class MedicalImageLocatorApp:
         except ValueError:
             return
         self._update_current_view()
+
+    def _on_term_double_click(self, _event: tk.Event) -> None:
+        selection = self.term_tree.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0])
+        except ValueError:
+            return
+        if 0 <= index < len(self.terms):
+            self.terms[index].enabled = not self.terms[index].enabled
+            self._refresh_terms_list()
+
+    def select_all_terms(self) -> None:
+        for term in self.terms:
+            term.enabled = True
+        self._refresh_terms_list()
+
+    def clear_terms(self) -> None:
+        if self.busy:
+            return
+        self.terms.clear()
+        for record in self.records:
+            record.results.clear()
+            record.errors.clear()
+            record.annotated_image = None
+            record.error = ""
+            record.status = "Loaded"
+        self._refresh_terms_list()
+        self._refresh_image_list()
+        self._update_current_view()
+        self.status_var.set("Cleared terms and overlays.")
+
+    def _report_text(self) -> str:
+        return self.report_text.get("1.0", tk.END).strip()
+
+    def _selected_report_provider(self) -> str:
+        provider = self.report_provider_var.get().strip().lower()
+        return "lightcone" if provider.startswith("lightcone") else "openai"
+
+    def _refresh_terms_list(self) -> None:
+        selected = self.term_tree.selection()
+        self.term_tree.delete(*self.term_tree.get_children())
+        for index, term in enumerate(self.terms):
+            found = self._term_found_count(term.name)
+            status = self._term_status(term.name)
+            self.term_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                text=term.name,
+                values=("yes" if term.enabled else "no", str(found), status),
+            )
+        if selected:
+            iid = selected[0]
+            if self.term_tree.exists(iid):
+                self.term_tree.selection_set(iid)
+        self._update_term_summary()
+
+    def _term_found_count(self, term_name: str) -> int:
+        return sum(
+            1
+            for record in self.records
+            if term_name in record.results and record.results[term_name].pixel_box is not None
+        )
+
+    def _term_status(self, term_name: str) -> str:
+        errors = sum(1 for record in self.records if term_name in record.errors)
+        attempted = sum(1 for record in self.records if term_name in record.results or term_name in record.errors)
+        found = self._term_found_count(term_name)
+        if errors:
+            return f"{errors} error"
+        if found:
+            return "Marked"
+        if attempted:
+            return "No region"
+        return "Ready"
+
+    def _update_term_summary(self) -> None:
+        total = len(self.terms)
+        selected = sum(1 for term in self.terms if term.enabled)
+        marked = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is not None)
+        if not total:
+            self.term_summary_var.set("No terms extracted")
+            return
+        self.term_summary_var.set(f"{selected}/{total} terms selected | {marked} marked regions")
+
+    def _refresh_record_annotation(self, record: ImageRecord) -> None:
+        marked_results = [result for result in record.results.values() if result.pixel_box is not None]
+        record.annotated_image = draw_annotations(record.image, marked_results) if marked_results else None
+
+    def _set_record_status(self, record: ImageRecord) -> None:
+        marked = sum(1 for result in record.results.values() if result.pixel_box is not None)
+        attempted = len(record.results) + len(record.errors)
+        if record.errors and not marked:
+            record.status = "Error"
+        elif record.errors:
+            record.status = f"Marked {marked} + errors"
+        elif marked:
+            record.status = f"Marked {marked}"
+        elif attempted:
+            record.status = "No region"
+        else:
+            record.status = "Loaded"
 
     def _refresh_image_list(self) -> None:
         selected = self.selected_index
@@ -540,12 +745,12 @@ class MedicalImageLocatorApp:
 
     def _update_summary(self) -> None:
         total = len(self.records)
-        marked = sum(1 for record in self.records if record.status == "Marked")
-        errors = sum(1 for record in self.records if record.status == "Error")
+        marked = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is not None)
+        errors = sum(len(record.errors) for record in self.records)
         if not total:
             self.summary_var.set("No images loaded")
             return
-        self.summary_var.set(f"{total} images | {marked} marked | {errors} errors")
+        self.summary_var.set(f"{total} images | {marked} marked regions | {errors} errors")
 
     def _update_action_states(self) -> None:
         current = self._current_record()
@@ -557,8 +762,10 @@ class MedicalImageLocatorApp:
         self.load_button.configure(state=normal_if_ready)
         self.folder_button.configure(state=normal_if_ready)
         self.clear_study_button.configure(state=normal_if_ready)
-        self.ask_button.configure(state=normal_if_ready if current is not None else "disabled")
-        self.ask_all_button.configure(state=normal_if_ready if has_images else "disabled")
+        self.extract_button.configure(state=normal_if_ready)
+        self.locate_terms_button.configure(state=normal_if_ready if has_images and any(term.enabled for term in self.terms) else "disabled")
+        self.select_terms_button.configure(state=normal_if_ready if self.terms else "disabled")
+        self.clear_terms_button.configure(state=normal_if_ready if self.terms else "disabled")
         self.save_button.configure(state="normal" if current_annotated and not self.busy else "disabled")
         self.save_all_button.configure(state="normal" if has_annotated and not self.busy else "disabled")
         self.clear_button.configure(state="normal" if current_annotated and not self.busy else "disabled")
@@ -571,6 +778,7 @@ class MedicalImageLocatorApp:
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
+        self._refresh_terms_list()
         self._update_action_states()
 
     def _set_answer(self, text: str) -> None:
@@ -659,39 +867,58 @@ def _first_number(value: object) -> float | None:
         return None
 
 
+ANNOTATION_COLORS = (
+    (255, 48, 48),
+    (0, 168, 255),
+    (255, 176, 0),
+    (33, 186, 115),
+    (180, 95, 255),
+    (255, 95, 160),
+    (0, 190, 190),
+)
+
+
 def draw_annotation(image: Image.Image, result: LocalizationResult) -> Image.Image:
+    return draw_annotations(image, [result])
+
+
+def draw_annotations(image: Image.Image, results: list[LocalizationResult]) -> Image.Image:
     output = image.convert("RGB").copy()
     width, height = output.size
     stroke = max(3, min(width, height) // 180)
-    color = _annotation_color(result)
+    for index, result in enumerate(results):
+        color = _annotation_color(result, index)
 
-    if result.pixel_box is not None:
-        x1, y1, x2, y2 = result.pixel_box.as_tuple()
-        _draw_region_overlay(output, (x1, y1, x2, y2), color, stroke)
+        if result.pixel_box is not None:
+            x1, y1, x2, y2 = result.pixel_box.as_tuple()
+            _draw_region_overlay(output, (x1, y1, x2, y2), color, stroke)
 
-    draw = ImageDraw.Draw(output)
+        draw = ImageDraw.Draw(output)
 
-    if result.pixel_point is not None:
-        x, y = result.pixel_point
-    elif result.pixel_box is not None:
-        x = (result.pixel_box.x1 + result.pixel_box.x2) // 2
-        y = (result.pixel_box.y1 + result.pixel_box.y2) // 2
-    else:
-        return output
+        if result.pixel_point is not None:
+            x, y = result.pixel_point
+        elif result.pixel_box is not None:
+            x = (result.pixel_box.x1 + result.pixel_box.x2) // 2
+            y = (result.pixel_box.y1 + result.pixel_box.y2) // 2
+        else:
+            continue
 
-    radius = max(8, min(width, height) // 80)
-    _draw_crosshair(draw, x, y, radius, color, stroke, output.size)
+        radius = max(8, min(width, height) // 80)
+        _draw_crosshair(draw, x, y, radius, color, stroke, output.size)
 
-    label = result.label or "Region"
-    if result.confidence is not None:
-        label += f" {result.confidence:.2f}"
-    _draw_label(draw, label, x + radius + 8, max(0, y - radius - 8), output.size, color)
+        label = result.label or "Region"
+        if result.confidence is not None:
+            label += f" {result.confidence:.2f}"
+        label_y = max(0, y - radius - 8 + index * (radius + 8))
+        _draw_label(draw, label, x + radius + 8, label_y, output.size, color)
     return output
 
 
-def _annotation_color(result: LocalizationResult) -> tuple[int, int, int]:
+def _annotation_color(result: LocalizationResult, index: int = 0) -> tuple[int, int, int]:
     if result.mode == "computer_action" and (result.label or "").lower() == "pointer":
         return (0, 168, 255)
+    if result.label:
+        return ANNOTATION_COLORS[index % len(ANNOTATION_COLORS)]
     if result.mode == "computer_action":
         return (255, 176, 0)
     return (255, 48, 48)
@@ -782,9 +1009,30 @@ def _draw_label(
 def format_record(record: ImageRecord) -> str:
     if record.error:
         return record.error
-    if record.result is None:
-        return "No result yet."
-    return format_result(record.result)
+    if not record.results and not record.errors:
+        return "No localization results yet."
+
+    lines: list[str] = []
+    for term_name, result in record.results.items():
+        status = "Marked" if result.pixel_box is not None else "No region"
+        lines.append(f"{term_name}: {status}")
+        answer = result.answer.strip()
+        if answer:
+            lines.append(answer)
+        if result.model_box is not None and result.pixel_box is not None:
+            lines.append(f"Model box 0..999: {result.model_box.as_tuple()}")
+            lines.append(f"Pixel box: {result.pixel_box.as_tuple()}")
+        if result.model_point is not None and result.pixel_point is not None:
+            lines.append(f"Model point 0..999: {result.model_point}")
+            lines.append(f"Pixel point: {result.pixel_point}")
+        lines.append("")
+
+    for term_name, error in record.errors.items():
+        lines.append(f"{term_name}: Error")
+        lines.append(error)
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def format_result(result: LocalizationResult) -> str:
@@ -798,6 +1046,36 @@ def format_result(result: LocalizationResult) -> str:
         lines.append(f"Pixel point: {result.pixel_point}")
     if result.mode:
         lines.append(f"Mode: {result.mode}")
+    return "\n".join(lines)
+
+
+def format_terms(terms: list[ReportTerm]) -> str:
+    if not terms:
+        return "No localizable terms found."
+    lines = ["Extracted terms:"]
+    for index, term in enumerate(terms, start=1):
+        lines.append(f"{index}. {term.name}")
+        if term.aliases:
+            lines.append("   Aliases: " + ", ".join(term.aliases[:8]))
+        if term.context:
+            lines.append("   Context: " + term.context)
+    return "\n".join(lines)
+
+
+def format_study_results(records: list[ImageRecord], terms: list[ReportTerm]) -> str:
+    if not terms:
+        return "No terms extracted."
+
+    lines = ["Found by term:"]
+    for term in terms:
+        found = [record.path.name for record in records if record.results.get(term.name) and record.results[term.name].pixel_box is not None]
+        errors = [record.path.name for record in records if term.name in record.errors]
+        if found:
+            lines.append(f"- {term.name}: " + ", ".join(found))
+        elif errors:
+            lines.append(f"- {term.name}: errors on " + ", ".join(errors))
+        else:
+            lines.append(f"- {term.name}: no region found")
     return "\n".join(lines)
 
 

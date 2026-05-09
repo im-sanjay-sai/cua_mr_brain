@@ -1,12 +1,21 @@
 import unittest
 
-from medical_image_locator.coordinate_utils import (
-    Box,
-    clamp_model_coord,
-    denormalize_box,
-    denormalize_point,
-    normalize_box,
-)
+try:
+    from medical_image_locator_report_identify.coordinate_utils import (
+        Box,
+        clamp_model_coord,
+        denormalize_box,
+        denormalize_point,
+        normalize_box,
+    )
+except ModuleNotFoundError:
+    from coordinate_utils import (
+        Box,
+        clamp_model_coord,
+        denormalize_box,
+        denormalize_point,
+        normalize_box,
+    )
 
 
 class CoordinateUtilsTests(unittest.TestCase):
