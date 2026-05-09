@@ -52,6 +52,19 @@ python -m medical_image_locator_report_identify
 6. Click **Locate Selected**.
 7. Save the current annotated image or all annotated images.
 
+Each loaded image gets a stable study ID such as `IMG-001`. After localization finishes, the app chooses one best image ID per term and shows it in the term table's **Region** column. The image table also has a **Region** column showing which terms selected that image as their best representative.
+
+The best-region score is deterministic app-side post-processing:
+
+```python
+confidence = model_confidence if present else 0.5
+area_ratio = box_area / image_area
+area_score = min(area_ratio / 0.25, 1.0)
+score = confidence * 0.85 + area_score * 0.15
+```
+
+So model confidence is weighted most heavily, and box area is used as a supporting signal. If a term is not found on any image, its region stays `-`.
+
 ## Coordinates
 
 Lightcone/Northstar returns coordinates in a fixed `0..999` grid. This app follows that rule:

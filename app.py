@@ -31,6 +31,7 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".dcm"
 class ImageRecord:
     path: Path
     image: Image.Image
+    image_id: str = ""
     annotated_image: Image.Image | None = None
     results: dict[str, LocalizationResult] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
@@ -42,6 +43,17 @@ class ImageRecord:
         return self.annotated_image or self.image
 
 
+@dataclass(frozen=True)
+class BestRegion:
+    term_name: str
+    image_id: str
+    image_name: str
+    area: int
+    area_ratio: float
+    confidence: float
+    score: float
+
+
 class MedicalImageLocatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -51,6 +63,7 @@ class MedicalImageLocatorApp:
 
         self.records: list[ImageRecord] = []
         self.terms: list[ReportTerm] = []
+        self.best_regions: dict[str, BestRegion] = {}
         self.selected_index = -1
         self.tk_image: ImageTk.PhotoImage | None = None
         self.busy = False
@@ -114,15 +127,19 @@ class MedicalImageLocatorApp:
 
         self.image_tree = ttk.Treeview(
             list_frame,
-            columns=("status",),
+            columns=("image_id", "status", "region"),
             show="tree headings",
             selectmode="browse",
             height=18,
         )
         self.image_tree.heading("#0", text="File")
+        self.image_tree.heading("image_id", text="ID")
         self.image_tree.heading("status", text="Status")
-        self.image_tree.column("#0", width=185, minwidth=140, stretch=True)
-        self.image_tree.column("status", width=80, minwidth=70, stretch=False)
+        self.image_tree.heading("region", text="Region")
+        self.image_tree.column("#0", width=145, minwidth=120, stretch=True)
+        self.image_tree.column("image_id", width=72, minwidth=64, stretch=False)
+        self.image_tree.column("status", width=92, minwidth=76, stretch=False)
+        self.image_tree.column("region", width=110, minwidth=82, stretch=False)
         self.image_tree.grid(row=0, column=0, sticky="nsew")
         self.image_tree.bind("<<TreeviewSelect>>", self._on_image_select)
 
@@ -189,7 +206,7 @@ class MedicalImageLocatorApp:
         term_frame.rowconfigure(0, weight=1)
         self.term_tree = ttk.Treeview(
             term_frame,
-            columns=("use", "found", "status"),
+            columns=("use", "found", "region", "status"),
             show="tree headings",
             selectmode="browse",
             height=8,
@@ -197,10 +214,12 @@ class MedicalImageLocatorApp:
         self.term_tree.heading("#0", text="Term")
         self.term_tree.heading("use", text="Use")
         self.term_tree.heading("found", text="Found")
+        self.term_tree.heading("region", text="Region")
         self.term_tree.heading("status", text="Status")
-        self.term_tree.column("#0", width=170, minwidth=120, stretch=True)
+        self.term_tree.column("#0", width=150, minwidth=110, stretch=True)
         self.term_tree.column("use", width=46, minwidth=42, stretch=False, anchor="center")
         self.term_tree.column("found", width=56, minwidth=50, stretch=False, anchor="center")
+        self.term_tree.column("region", width=76, minwidth=68, stretch=False, anchor="center")
         self.term_tree.column("status", width=92, minwidth=76, stretch=False)
         self.term_tree.grid(row=0, column=0, sticky="nsew")
         self.term_tree.bind("<Double-1>", self._on_term_double_click)
@@ -318,7 +337,8 @@ class MedicalImageLocatorApp:
             except Exception as exc:
                 failures.append(f"{path.name}: {exc}")
                 continue
-            self.records.append(ImageRecord(path=path, image=image))
+            image_id = make_image_id(len(self.records))
+            self.records.append(ImageRecord(path=path, image=image, image_id=image_id))
             existing.add(resolved)
             loaded += 1
 
@@ -341,6 +361,7 @@ class MedicalImageLocatorApp:
         if self.busy:
             return
         self.records.clear()
+        self.best_regions.clear()
         self.selected_index = -1
         self._refresh_image_list()
         self._refresh_terms_list()
@@ -405,6 +426,7 @@ class MedicalImageLocatorApp:
 
     def _handle_terms_extracted(self, terms: list[ReportTerm], provider: str) -> None:
         self.terms = terms
+        self.best_regions.clear()
         for record in self.records:
             record.results.clear()
             record.errors.clear()
@@ -433,6 +455,7 @@ class MedicalImageLocatorApp:
             return
 
         self._set_busy(True)
+        self.best_regions.clear()
         for record in self.records:
             record.results.clear()
             record.errors.clear()
@@ -528,11 +551,15 @@ class MedicalImageLocatorApp:
         self._update_action_states()
 
     def _finish_term_batch(self) -> None:
+        self.best_regions = choose_best_regions(self.records, self.terms)
         marked = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is not None)
         missing = sum(1 for record in self.records for result in record.results.values() if result.pixel_box is None)
         errors = sum(len(record.errors) for record in self.records)
         self.status_var.set(f"Finished. Marked {marked}; no region {missing}; errors {errors}.")
-        self._set_answer(format_study_results(self.records, self.terms))
+        self._refresh_image_list()
+        self._refresh_terms_list()
+        self._update_current_view()
+        self._set_answer(format_study_results(self.records, self.terms, self.best_regions))
         self._set_busy(False)
 
     def save_current(self) -> None:
@@ -573,6 +600,7 @@ class MedicalImageLocatorApp:
         record.errors.clear()
         record.error = ""
         record.status = "Loaded"
+        self.best_regions = choose_best_regions(self.records, self.terms)
         self._refresh_image_list()
         self._refresh_terms_list()
         self._update_current_view()
@@ -585,6 +613,7 @@ class MedicalImageLocatorApp:
             record.errors.clear()
             record.error = ""
             record.status = "Loaded"
+        self.best_regions.clear()
         self._refresh_image_list()
         self._refresh_terms_list()
         self._update_current_view()
@@ -635,6 +664,7 @@ class MedicalImageLocatorApp:
         if self.busy:
             return
         self.terms.clear()
+        self.best_regions.clear()
         for record in self.records:
             record.results.clear()
             record.errors.clear()
@@ -658,13 +688,14 @@ class MedicalImageLocatorApp:
         self.term_tree.delete(*self.term_tree.get_children())
         for index, term in enumerate(self.terms):
             found = self._term_found_count(term.name)
+            region = self._term_region_image_id(term.name)
             status = self._term_status(term.name)
             self.term_tree.insert(
                 "",
                 "end",
                 iid=str(index),
                 text=term.name,
-                values=("yes" if term.enabled else "no", str(found), status),
+                values=("yes" if term.enabled else "no", str(found), region, status),
             )
         if selected:
             iid = selected[0]
@@ -690,6 +721,16 @@ class MedicalImageLocatorApp:
         if attempted:
             return "No region"
         return "Ready"
+
+    def _term_region_image_id(self, term_name: str) -> str:
+        best = self.best_regions.get(term_name)
+        return best.image_id if best is not None else "-"
+
+    def _record_region_terms(self, image_id: str) -> str:
+        terms = [best.term_name for best in self.best_regions.values() if best.image_id == image_id]
+        if not terms:
+            return "-"
+        return ", ".join(terms[:3]) + ("..." if len(terms) > 3 else "")
 
     def _update_term_summary(self) -> None:
         total = len(self.terms)
@@ -722,7 +763,13 @@ class MedicalImageLocatorApp:
         selected = self.selected_index
         self.image_tree.delete(*self.image_tree.get_children())
         for index, record in enumerate(self.records):
-            self.image_tree.insert("", "end", iid=str(index), text=record.path.name, values=(record.status,))
+            self.image_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                text=record.path.name,
+                values=(record.image_id, record.status, self._record_region_terms(record.image_id)),
+            )
         self._select_tree_index(selected)
         self._update_summary()
 
@@ -738,7 +785,10 @@ class MedicalImageLocatorApp:
             self.image_meta.configure(text="")
             self._set_answer("")
         else:
-            self.image_meta.configure(text=f"{record.path.name} | {record.image.width}x{record.image.height} | {record.status}")
+            region = self._record_region_terms(record.image_id)
+            self.image_meta.configure(
+                text=f"{record.image_id} | {record.path.name} | {record.image.width}x{record.image.height} | {record.status} | Region: {region}"
+            )
             self._set_answer(format_record(record))
         self._render_canvas()
         self._update_action_states()
@@ -865,6 +915,70 @@ def _first_number(value: object) -> float | None:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def make_image_id(index: int) -> str:
+    return f"IMG-{index + 1:03d}"
+
+
+def choose_best_regions(records: list[ImageRecord], terms: list[ReportTerm]) -> dict[str, BestRegion]:
+    best_regions: dict[str, BestRegion] = {}
+    term_names = [term.name for term in terms]
+    for term_name in term_names:
+        candidates: list[tuple[tuple[float, float, int, int], BestRegion]] = []
+        for index, record in enumerate(records):
+            result = record.results.get(term_name)
+            if result is None or result.pixel_box is None:
+                continue
+            image_id = record.image_id or make_image_id(index)
+            best = score_region_candidate(term_name, record.path.name, image_id, record.image.size, result)
+            if best is None:
+                continue
+            confidence_sort = best.confidence
+            tie_breaker = (-index)
+            candidates.append(((best.score, confidence_sort, best.area, tie_breaker), best))
+        if candidates:
+            best_regions[term_name] = max(candidates, key=lambda item: item[0])[1]
+    return best_regions
+
+
+def score_region_candidate(
+    term_name: str,
+    image_name: str,
+    image_id: str,
+    image_size: tuple[int, int],
+    result: LocalizationResult,
+) -> BestRegion | None:
+    if result.pixel_box is None:
+        return None
+
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+
+    x1, y1, x2, y2 = result.pixel_box.as_tuple()
+    area = max(0, x2 - x1) * max(0, y2 - y1)
+    area_ratio = area / max(1, width * height)
+    confidence = clamp_score(result.confidence if result.confidence is not None else 0.5)
+    area_score = min(area_ratio / 0.25, 1.0)
+    score = confidence * 0.85 + area_score * 0.15
+    return BestRegion(
+        term_name=term_name,
+        image_id=image_id,
+        image_name=image_name,
+        area=area,
+        area_ratio=area_ratio,
+        confidence=confidence,
+        score=score,
+    )
+
+
+def clamp_score(value: object) -> float:
+    try:
+        score = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        score = 0.0
+    return max(0.0, min(1.0, score))
 
 
 ANNOTATION_COLORS = (
@@ -1062,16 +1176,28 @@ def format_terms(terms: list[ReportTerm]) -> str:
     return "\n".join(lines)
 
 
-def format_study_results(records: list[ImageRecord], terms: list[ReportTerm]) -> str:
+def format_study_results(
+    records: list[ImageRecord],
+    terms: list[ReportTerm],
+    best_regions: dict[str, BestRegion] | None = None,
+) -> str:
     if not terms:
         return "No terms extracted."
 
     lines = ["Found by term:"]
+    best_regions = best_regions or {}
     for term in terms:
         found = [record.path.name for record in records if record.results.get(term.name) and record.results[term.name].pixel_box is not None]
         errors = [record.path.name for record in records if term.name in record.errors]
         if found:
-            lines.append(f"- {term.name}: " + ", ".join(found))
+            best = best_regions.get(term.name)
+            if best is not None:
+                lines.append(
+                    f"- {term.name}: best {best.image_id} | score {best.score:.2f} | confidence {best.confidence:.2f} | area {best.area} px"
+                )
+                lines.append("  Found: " + ", ".join(found))
+            else:
+                lines.append(f"- {term.name}: " + ", ".join(found))
         elif errors:
             lines.append(f"- {term.name}: errors on " + ", ".join(errors))
         else:
